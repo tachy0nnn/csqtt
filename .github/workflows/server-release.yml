@@ -1,11 +1,15 @@
-# SPDX-FileCopyrightText: 2026 amurcanov
+# SPDX-FileCopyrightText: 2026 thankyon
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #
 # Builds the three statically linked Linux server binaries on version tags and
 # attaches them to that tag's GitHub Release, together with the build
 # provenance manifest and a SHA256SUMS file.
 #
-# Canonical local procedure: rust-server/build_linux.sh (.bat on Windows).
+# Canonical local procedure: rust-server/build_linux.sh (.bat on Windows)
+# invoked with --diagnostics. CI mirrors that procedure step for step with the
+# diagnostics feature ON (`--features diagnostics` on every cargo gate/build
+# step), so release binaries include the dpi/syscalls/perf/metric monitors.
+# Local parity command: build_linux.sh --tests --diagnostics.
 # CI mirrors that procedure step for step instead of invoking the script
 # end-to-end, because the script has no single-target mode (this ticket must
 # not touch scripts/) and its trailing provenance Write+Verify step only runs
@@ -186,27 +190,29 @@ jobs:
       - name: Check formatting
         run: cargo +"${{ env.RUST_TOOLCHAIN }}" fmt --all -- --check
 
-      # Gate 2/4 — mirrors build_linux.sh line 112.
+      # Gate 2/4 — mirrors build_linux.sh line 112 with --diagnostics
+      # (FEATURE_ARGS=(--features diagnostics)).
       - name: Check all targets via zigbuild
-        run: cargo +"${{ env.RUST_TOOLCHAIN }}" zigbuild --all-targets --target x86_64-unknown-linux-musl
+        run: cargo +"${{ env.RUST_TOOLCHAIN }}" zigbuild --features diagnostics --all-targets --target x86_64-unknown-linux-musl
 
-      # Gate 3/4 — mirrors build_linux.sh line 113 (dedicated target dir kept
-      # so clippy artefacts never mix into the release target dir).
+      # Gate 3/4 — mirrors build_linux.sh line 113 with --diagnostics
+      # (dedicated target dir kept so clippy artefacts never mix into the
+      # release target dir).
       - name: Clippy (release, warnings denied)
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/rust-server/build/linux-musl-check
-        run: cargo +"${{ env.RUST_TOOLCHAIN }}" clippy --release --target x86_64-unknown-linux-musl --all-targets -- -D warnings
+        run: cargo +"${{ env.RUST_TOOLCHAIN }}" clippy --features diagnostics --release --target x86_64-unknown-linux-musl --all-targets -- -D warnings
 
-      # Gate 4/4 — mirrors the Linux branch of build_linux.sh lines 114-116:
-      # on a Linux host the x86_64 musl test suite executes (on other hosts
-      # the script only compiles it).
+      # Gate 4/4 — mirrors the Linux branch of build_linux.sh lines 114-116
+      # with --diagnostics: on a Linux host the x86_64 musl test suite
+      # executes (on other hosts the script only compiles it).
       - name: Run Linux musl tests
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/rust-server/build/linux-musl-tests
-        run: cargo +"${{ env.RUST_TOOLCHAIN }}" test --target x86_64-unknown-linux-musl --all-targets
+        run: cargo +"${{ env.RUST_TOOLCHAIN }}" test --features diagnostics --target x86_64-unknown-linux-musl --all-targets
 
-      # Mirrors build_variant in build_linux.sh lines 122-133 for this leg's
-      # matrix target only. The script builds all three targets per
+      # Mirrors build_variant in build_linux.sh lines 122-133 with --diagnostics
+      # for this leg's matrix target only. The script builds all three targets per
       # invocation and offers no single-target mode (out of scope to add
       # here), hence one leg per target. The app/src/main/assets copy (script
       # lines 129-130, 137) is intentionally omitted: provenance staging
@@ -230,7 +236,7 @@ jobs:
           unset CC_x86_64_unknown_linux_musl CXX_x86_64_unknown_linux_musl AR_x86_64_unknown_linux_musl CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
           unset CC_aarch64_unknown_linux_musl CXX_aarch64_unknown_linux_musl AR_aarch64_unknown_linux_musl CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
           unset CC_armv7_unknown_linux_musleabihf CXX_armv7_unknown_linux_musleabihf AR_armv7_unknown_linux_musleabihf CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER
-          cargo +"${{ env.RUST_TOOLCHAIN }}" zigbuild --release --target "${{ matrix.target }}"
+          cargo +"${{ env.RUST_TOOLCHAIN }}" zigbuild --features diagnostics --release --target "${{ matrix.target }}"
           mkdir -p dist
           cp "build/linux-musl/${{ matrix.target }}/release/csqtt" "dist/${{ matrix.asset }}"
           chmod +x "dist/${{ matrix.asset }}"

@@ -10,3 +10,10 @@ target/
 # from GitHub Releases — they must never be committed or embedded blindly.
 app/src/main/assets/csqtt-linux-*
 app/src/main/assets/csqtt.server-provenance.json
+# Release signing material must never be committed. CI receives the keystore
+# via the ANDROID_KEYSTORE_BASE64 secret; local builds read it through the
+# KEYSTORE_* env vars or local.properties (which is a tracked template, so
+# never put real passwords in it).
+*.keystore
+*.jks
+release.keystore
