@@ -1,0 +1,321 @@
+# SPDX-FileCopyrightText: 2026 amurcanov
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+#
+# Builds the three statically linked Linux server binaries on version tags and
+# attaches them to that tag's GitHub Release, together with the build
+# provenance manifest and a SHA256SUMS file.
+#
+# Canonical local procedure: rust-server/build_linux.sh (.bat on Windows).
+# CI mirrors that procedure step for step instead of invoking the script
+# end-to-end, because the script has no single-target mode (this ticket must
+# not touch scripts/) and its trailing provenance Write+Verify step only runs
+# on Windows: scripts/server_asset_provenance.ps1 joins paths with "\", which
+# PowerShell treats as a literal character on Linux, so the script can neither
+# succeed nor be skipped on ubuntu-latest (its fallback branch exits 1). The
+# collect/publish job therefore runs on windows-latest, where it reuses the
+# provenance script unmodified. Each "parity" comment cites the script lines
+# the step mirrors.
+
+name: server-release
+
+"on":
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to rebuild and republish (e.g. v2.1.9). Retry backstop: reruns a failed tag build without pushing a new tag."
+        required: true
+        type: string
+
+# softprops/action-gh-release attaches assets via GITHUB_TOKEN; it needs
+# contents: write and nothing else.
+permissions:
+  contents: write
+
+# Pinned toolchain. Rust MUST match rust-server/Cargo.toml `rust-version` and
+# rust-server/rust-toolchain.toml `channel`. Zig and cargo-zigbuild are pinned
+# here because build_linux.sh only asserts their presence (no local pin exists
+# to mirror) — see the parity gaps in the ticket notes.
+env:
+  RUST_TOOLCHAIN: "1.97.1"
+  ZIG_VERSION: "0.15.2"
+  CARGO_ZIGBUILD_VERSION: "0.23.0"
+
+# Serialise publishes per ref so a manual retry cannot race the tag build over
+# the same Release assets.
+concurrency:
+  group: server-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build ${{ matrix.asset }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Asset names MUST stay exactly these: the deploy flow maps VPS
+          # architecture to per-arch binary name, and the provenance script
+          # asserts the same three names (assetSpecs).
+          - target: x86_64-unknown-linux-musl
+            zig_target: x86_64-linux-musl
+            asset: csqtt-linux-amd64
+          - target: aarch64-unknown-linux-musl
+            zig_target: aarch64-linux-musl
+            asset: csqtt-linux-arm64
+          - target: armv7-unknown-linux-musleabihf
+            zig_target: armv7-linux-musleabihf
+            asset: csqtt-linux-armv7
+    defaults:
+      run:
+        shell: bash
+        working-directory: rust-server
+    steps:
+      - name: Resolve release tag
+        id: release-tag
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="${{ inputs.tag }}"
+          fi
+          if [[ -z "$TAG" ]]; then
+            echo "::error::No tag resolved. Manual runs must pass the 'tag' input (e.g. v2.1.9)."
+            exit 1
+          fi
+          if [[ "$TAG" != v* ]]; then
+            echo "::error::Tag must match 'v*' (got '$TAG')."
+            exit 1
+          fi
+          echo "value=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag: $TAG"
+
+      - name: Check out ${{ steps.release-tag.outputs.value }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release-tag.outputs.value }}
+
+      # Mirrors build_linux.sh line 38 (`rustup toolchain install ...`) and
+      # rust-server/rust-toolchain.toml (minimal profile, rustfmt, clippy).
+      # The explicit `rustup target add` step below keeps the one-to-one
+      # mapping with script line 39.
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} (minimal + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          profile: minimal
+          components: rustfmt, clippy
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          # The build sets its own per-asset ZIG_*_CACHE_DIR under build/
+          # (mirroring build_variant), so the action's default-dir cache is
+          # intentionally off.
+          use-cache: false
+
+      - name: Install cargo-zigbuild ${{ env.CARGO_ZIGBUILD_VERSION }}
+        run: cargo install cargo-zigbuild --version "${{ env.CARGO_ZIGBUILD_VERSION }}" --locked
+
+      # Mirrors build_linux.sh line 39. Idempotent; doubles as the
+      # installed-targets assertion.
+      - name: Add musl targets
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf --toolchain "${{ env.RUST_TOOLCHAIN }}"
+          rustup target list --toolchain "${{ env.RUST_TOOLCHAIN }}" --installed
+
+      # Mirrors build_linux.sh lines 34-41 (tool presence + version echo).
+      - name: Show tool versions
+        run: |
+          set -euo pipefail
+          rustc +"${{ env.RUST_TOOLCHAIN }}" --version
+          cargo +"${{ env.RUST_TOOLCHAIN }}" --version
+          zig version
+          cargo zigbuild --help > /dev/null
+
+      # Byte-identical Linux branch of build_linux.sh lines 71-96, plus the
+      # exports of lines 97-109. The wrappers strip the `--target=*` args the
+      # `cc` crate passes and force the script's CSQTT_ZIG_TARGET instead.
+      # They are load-bearing for the plain-`cargo` clippy/test steps below
+      # (cargo-zigbuild only wraps its own invocations; plain `cargo clippy`
+      # / `cargo test --target x86_64-unknown-linux-musl` need a musl-capable
+      # CC and linker, and .cargo/config.toml sets link-self-contained=no).
+      # Exported via GITHUB_ENV so later steps see them, exactly as the
+      # script's exports persist for both its checks and its release builds.
+      # (printf one-liners instead of heredocs: a heredoc terminator cannot be
+      # indented inside a YAML block scalar.)
+      - name: Set up Linux zig wrappers (build_linux.sh:71-109)
+        run: |
+          set -euo pipefail
+          WRAP="$PWD/build/zig-wrappers"
+          mkdir -p "$WRAP"
+          printf '%s\n' '#!/usr/bin/env bash' 'args=()' 'for arg in "$@"; do' '  [[ "$arg" == --target=* ]] || args+=("$arg")' 'done' 'exec zig cc -target "$CSQTT_ZIG_TARGET" "${args[@]}"' > "$WRAP/zigcc"
+          printf '%s\n' '#!/usr/bin/env bash' 'args=()' 'for arg in "$@"; do' '  [[ "$arg" == --target=* ]] || args+=("$arg")' 'done' 'exec zig c++ -target "$CSQTT_ZIG_TARGET" "${args[@]}"' > "$WRAP/zigcxx"
+          printf '%s\n' '#!/usr/bin/env bash' 'exec zig ar "$@"' > "$WRAP/zigar"
+          chmod +x "$WRAP/zigcc" "$WRAP/zigcxx" "$WRAP/zigar"
+          {
+            echo "CC_x86_64_unknown_linux_musl=$WRAP/zigcc"
+            echo "CXX_x86_64_unknown_linux_musl=$WRAP/zigcxx"
+            echo "AR_x86_64_unknown_linux_musl=$WRAP/zigar"
+            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=$WRAP/zigcc"
+            echo "CC_aarch64_unknown_linux_musl=$WRAP/zigcc"
+            echo "CXX_aarch64_unknown_linux_musl=$WRAP/zigcxx"
+            echo "AR_aarch64_unknown_linux_musl=$WRAP/zigar"
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$WRAP/zigcc"
+            echo "CC_armv7_unknown_linux_musleabihf=$WRAP/zigcc"
+            echo "CXX_armv7_unknown_linux_musleabihf=$WRAP/zigcxx"
+            echo "AR_armv7_unknown_linux_musleabihf=$WRAP/zigar"
+            echo "CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER=$WRAP/zigcc"
+            echo "CSQTT_ZIG_TARGET=x86_64-linux-musl"
+          } >> "$GITHUB_ENV"
+
+      # Gate 1/4 — mirrors build_linux.sh line 111. Runs in every matrix leg
+      # so each leg's binary is provably a checked build.
+      - name: Check formatting
+        run: cargo +"${{ env.RUST_TOOLCHAIN }}" fmt --all -- --check
+
+      # Gate 2/4 — mirrors build_linux.sh line 112.
+      - name: Check all targets via zigbuild
+        run: cargo +"${{ env.RUST_TOOLCHAIN }}" zigbuild --all-targets --target x86_64-unknown-linux-musl
+
+      # Gate 3/4 — mirrors build_linux.sh line 113 (dedicated target dir kept
+      # so clippy artefacts never mix into the release target dir).
+      - name: Clippy (release, warnings denied)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/rust-server/build/linux-musl-check
+        run: cargo +"${{ env.RUST_TOOLCHAIN }}" clippy --release --target x86_64-unknown-linux-musl --all-targets -- -D warnings
+
+      # Gate 4/4 — mirrors the Linux branch of build_linux.sh lines 114-116:
+      # on a Linux host the x86_64 musl test suite executes (on other hosts
+      # the script only compiles it).
+      - name: Run Linux musl tests
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/rust-server/build/linux-musl-tests
+        run: cargo +"${{ env.RUST_TOOLCHAIN }}" test --target x86_64-unknown-linux-musl --all-targets
+
+      # Mirrors build_variant in build_linux.sh lines 122-133 for this leg's
+      # matrix target only. The script builds all three targets per
+      # invocation and offers no single-target mode (out of scope to add
+      # here), hence one leg per target. The app/src/main/assets copy (script
+      # lines 129-130, 137) is intentionally omitted: provenance staging
+      # happens once, over the collected set, in the publish job.
+      - name: Build release binary (${{ matrix.target }})
+        env:
+          CSQTT_ZIG_TARGET: ${{ matrix.zig_target }}
+          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/rust-server/build/zig-cache/${{ matrix.asset }}/global
+          ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/rust-server/build/zig-cache/${{ matrix.asset }}/local
+          CARGO_TARGET_DIR: ${{ github.workspace }}/rust-server/build/linux-musl
+        run: |
+          set -euo pipefail
+          cargo +"${{ env.RUST_TOOLCHAIN }}" zigbuild --release --target "${{ matrix.target }}"
+          mkdir -p dist
+          cp "build/linux-musl/${{ matrix.target }}/release/csqtt" "dist/${{ matrix.asset }}"
+          chmod +x "dist/${{ matrix.asset }}"
+          ls -lh "dist/${{ matrix.asset }}"
+
+      - name: Upload ${{ matrix.asset }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: rust-server/dist/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release assets
+    needs: build
+    # windows-latest is deliberate, not incidental: the provenance script is
+    # reused unmodified, and it only runs on Windows (see the header comment).
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Resolve release tag
+        id: release-tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="${{ inputs.tag }}"
+          fi
+          if [[ -z "$TAG" ]]; then
+            echo "::error::No tag resolved. Manual runs must pass the 'tag' input (e.g. v2.1.9)."
+            exit 1
+          fi
+          if [[ "$TAG" != v* ]]; then
+            echo "::error::Tag must match 'v*' (got '$TAG')."
+            exit 1
+          fi
+          echo "value=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag: $TAG"
+
+      - name: Check out ${{ steps.release-tag.outputs.value }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release-tag.outputs.value }}
+
+      - name: Download server binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: csqtt-linux-*
+          path: release-assets
+          merge-multiple: true
+
+      # Stage the collected set where scripts/server_asset_provenance.ps1
+      # expects it (app\src\main\assets), then reuse the script unmodified:
+      # Write binds this exact set into csqtt.server-provenance.json, Verify
+      # re-checks ELF class/machine, the wire protocol revision, sizes and
+      # hashes. Mirrors build_linux.bat lines 135-137 (build_linux.sh lines
+      # 139-140 do the same via pwsh where the OS allows).
+      - name: Write and verify provenance
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assets = Join-Path $env:GITHUB_WORKSPACE 'app\src\main\assets'
+          New-Item -ItemType Directory -Path $assets -Force | Out-Null
+          foreach ($name in @('csqtt-linux-amd64', 'csqtt-linux-arm64', 'csqtt-linux-armv7')) {
+            $src = Join-Path $env:GITHUB_WORKSPACE "release-assets\$name"
+            if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { throw "Missing build artifact: $src" }
+            Copy-Item -LiteralPath $src -Destination (Join-Path $assets $name) -Force
+          }
+          $provenance = Join-Path $env:GITHUB_WORKSPACE 'scripts\server_asset_provenance.ps1'
+          & $provenance -Mode Write
+          if ($LASTEXITCODE -ne 0) { throw "Provenance Write failed with exit code $LASTEXITCODE" }
+          & $provenance -Mode Verify
+          if ($LASTEXITCODE -ne 0) { throw "Provenance Verify failed with exit code $LASTEXITCODE" }
+          Copy-Item -LiteralPath (Join-Path $assets 'csqtt.server-provenance.json') -Destination (Join-Path $env:GITHUB_WORKSPACE 'release-assets\csqtt.server-provenance.json') -Force
+
+      # No local counterpart: SHA256SUMS is CI-only. GNU sha256sum format
+      # ("<hex><two spaces><name>") so `sha256sum -c SHA256SUMS` verifies it
+      # anywhere, and it covers the binaries plus the provenance manifest.
+      - name: Write SHA256SUMS
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location (Join-Path $env:GITHUB_WORKSPACE 'release-assets')
+          $files = @('csqtt-linux-amd64', 'csqtt-linux-arm64', 'csqtt-linux-armv7', 'csqtt.server-provenance.json')
+          $lines = foreach ($f in $files) {
+            if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { throw "Missing release file: $f" }
+            ((Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLower()) + '  ' + $f
+          }
+          $lines | Set-Content -LiteralPath 'SHA256SUMS' -Encoding utf8NoBOM
+          Get-Content -LiteralPath 'SHA256SUMS'
+
+      - name: Attach assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release-tag.outputs.value }}
+          files: |
+            release-assets/csqtt-linux-amd64
+            release-assets/csqtt-linux-arm64
+            release-assets/csqtt-linux-armv7
+            release-assets/csqtt.server-provenance.json
+            release-assets/SHA256SUMS
+          fail_on_unmatched_files: true
