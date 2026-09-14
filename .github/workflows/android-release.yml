@@ -160,9 +160,9 @@ jobs:
         run: |
           set -euo pipefail
           cd rust-client
-          cargo +"${{ env.RUST_TOOLCHAIN }}" ndk -t arm64-v8a -p 26 build --release --target-dir "$GITHUB_WORKSPACE/build/rust-client-android-arm64"
-          cargo +"${{ env.RUST_TOOLCHAIN }}" ndk -t armeabi-v7a -p 26 build --release --target-dir "$GITHUB_WORKSPACE/build/rust-client-android-armeabi-v7a"
-          cargo +"${{ env.RUST_TOOLCHAIN }}" ndk -t x86_64 -p 26 build --release --target-dir "$GITHUB_WORKSPACE/build/rust-client-android-x86_64"
+          cargo +"${{ env.RUST_TOOLCHAIN }}" ndk -t arm64-v8a -P 26 build --release --target-dir "$GITHUB_WORKSPACE/build/rust-client-android-arm64"
+          cargo +"${{ env.RUST_TOOLCHAIN }}" ndk -t armeabi-v7a -P 26 build --release --target-dir "$GITHUB_WORKSPACE/build/rust-client-android-armeabi-v7a"
+          cargo +"${{ env.RUST_TOOLCHAIN }}" ndk -t x86_64 -P 26 build --release --target-dir "$GITHUB_WORKSPACE/build/rust-client-android-x86_64"
           mkdir -p ../app/src/main/jniLibs/arm64-v8a ../app/src/main/jniLibs/armeabi-v7a ../app/src/main/jniLibs/x86_64
           cp "$GITHUB_WORKSPACE/build/rust-client-android-arm64/aarch64-linux-android/release/client" ../app/src/main/jniLibs/arm64-v8a/libclient.so
           cp "$GITHUB_WORKSPACE/build/rust-client-android-armeabi-v7a/armv7-linux-androideabi/release/client" ../app/src/main/jniLibs/armeabi-v7a/libclient.so
