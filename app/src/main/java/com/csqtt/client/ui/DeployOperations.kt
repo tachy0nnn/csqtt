@@ -188,6 +188,21 @@ internal fun serverArchitectureForMachine(output: String): ServerArchitecture {
     }
 }
 
+internal fun resolveServerBinary(
+    context: Context,
+    workingDir: File,
+    architecture: ServerArchitecture,
+): File {
+    val target = File(workingDir, architecture.assetName)
+    context.assets.open(architecture.assetName).use { input ->
+        FileOutputStream(target).use { output -> input.copyTo(output) }
+    }
+    if (!target.isFile || target.length() == 0L) {
+        throw IOException("Файл ${architecture.assetName} отсутствует или пуст в assets")
+    }
+    return target
+}
+
 private fun deployAssetLabel(fileName: String): String = when (fileName) {
     "deploy.sh" -> "скрипт установки"
     "csqtt-linux-amd64" -> "сервер CSQTT (amd64)"
@@ -611,7 +626,7 @@ internal suspend fun performDeploy(
         }
 
         val scriptFile = extractAsset("deploy.sh")
-        val serverFile = extractAsset(serverArchitecture.assetName)
+        val serverFile = resolveServerBinary(context, workingDir, serverArchitecture)
         val environmentFile = File(workingDir, "csqtt.env").apply {
             writeText(
                 buildString {
