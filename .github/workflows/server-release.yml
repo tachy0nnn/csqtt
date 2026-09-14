@@ -110,7 +110,6 @@ jobs:
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-          profile: minimal
           components: rustfmt, clippy
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
