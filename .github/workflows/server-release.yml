@@ -148,8 +148,12 @@ jobs:
       # (cargo-zigbuild only wraps its own invocations; plain `cargo clippy`
       # / `cargo test --target x86_64-unknown-linux-musl` need a musl-capable
       # CC and linker, and .cargo/config.toml sets link-self-contained=no).
-      # Exported via GITHUB_ENV so later steps see them, exactly as the
-      # script's exports persist for both its checks and its release builds.
+      # Exported via GITHUB_ENV so the plain-cargo gate steps below see them
+      # (cargo-zigbuild only wraps its own invocations; plain `cargo clippy`
+      # / `cargo test --target x86_64-unknown-linux-musl` need a musl-capable
+      # CC and linker, and .cargo/config.toml sets link-self-contained=no).
+      # The release-build step unsets them again so cargo-zigbuild owns the
+      # toolchain there (see its comment).
       # (printf one-liners instead of heredocs: a heredoc terminator cannot be
       # indented inside a YAML block scalar.)
       - name: Set up Linux zig wrappers (build_linux.sh:71-109)
@@ -207,14 +211,25 @@ jobs:
       # here), hence one leg per target. The app/src/main/assets copy (script
       # lines 129-130, 137) is intentionally omitted: provenance staging
       # happens once, over the collected set, in the publish job.
+      #
+      # The zig-wrapper CC/CXX/AR/LINKER exports from the setup step are
+      # deliberately UNSET here (they stay active for the plain-cargo gate
+      # steps above, which need them). cargo-zigbuild configures the C
+      # compiler and linker itself; overriding it with the wrappers breaks
+      # non-x86_64 links (drill evidence: aarch64 duplicate _start/_start_c,
+      # armv7 unknown arch from the wrapper-forced zig target). This matches
+      # the local procedure, where the per-variant builds run with no CC
+      # exports and cargo-zigbuild owns the toolchain.
       - name: Build release binary (${{ matrix.target }})
         env:
-          CSQTT_ZIG_TARGET: ${{ matrix.zig_target }}
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/rust-server/build/zig-cache/${{ matrix.asset }}/global
           ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/rust-server/build/zig-cache/${{ matrix.asset }}/local
           CARGO_TARGET_DIR: ${{ github.workspace }}/rust-server/build/linux-musl
         run: |
           set -euo pipefail
+          unset CC_x86_64_unknown_linux_musl CXX_x86_64_unknown_linux_musl AR_x86_64_unknown_linux_musl CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
+          unset CC_aarch64_unknown_linux_musl CXX_aarch64_unknown_linux_musl AR_aarch64_unknown_linux_musl CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
+          unset CC_armv7_unknown_linux_musleabihf CXX_armv7_unknown_linux_musleabihf AR_armv7_unknown_linux_musleabihf CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER
           cargo +"${{ env.RUST_TOOLCHAIN }}" zigbuild --release --target "${{ matrix.target }}"
           mkdir -p dist
           cp "build/linux-musl/${{ matrix.target }}/release/csqtt" "dist/${{ matrix.asset }}"
