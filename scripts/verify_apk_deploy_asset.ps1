@@ -26,15 +26,6 @@ function Get-Sha256([byte[]]$Bytes) {
 $resolvedApk = (Resolve-Path -LiteralPath $ApkPath).Path
 $resolvedSource = (Resolve-Path -LiteralPath $SourcePath).Path
 $sourceBytes = [System.IO.File]::ReadAllBytes($resolvedSource)
-$assetDirectory = Split-Path -Parent $resolvedSource
-$serverAssetNames = @("csqtt-linux-amd64", "csqtt-linux-arm64", "csqtt-linux-armv7")
-$serverProvenancePath = Join-Path $assetDirectory "csqtt.server-provenance.json"
-$serverBinaryBytes = @{}
-foreach ($serverAssetName in $serverAssetNames) {
-    $serverBinaryPath = Join-Path $assetDirectory $serverAssetName
-    $serverBinaryBytes[$serverAssetName] = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $serverBinaryPath).Path)
-}
-$serverProvenanceBytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $serverProvenancePath).Path)
 
 function Get-ArchiveEntryBytes {
     param($Archive, [string]$Name)
@@ -59,11 +50,19 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archive = [System.IO.Compression.ZipFile]::OpenRead($resolvedApk)
 try {
     [byte[]]$apkAssetBytes = Get-ArchiveEntryBytes $archive "assets/deploy.sh"
-    $apkServerBinaryBytes = @{}
-    foreach ($serverAssetName in $serverAssetNames) {
-        $apkServerBinaryBytes[$serverAssetName] = Get-ArchiveEntryBytes $archive "assets/$serverAssetName"
+    # Deploy downloads the server binary from GitHub Releases at deploy time,
+    # so the APK must NOT embed server binaries or their provenance anymore.
+    $embeddedServerAssets = @(
+        "assets/csqtt-linux-amd64",
+        "assets/csqtt-linux-arm64",
+        "assets/csqtt-linux-armv7",
+        "assets/csqtt.server-provenance.json"
+    )
+    foreach ($embedded in $embeddedServerAssets) {
+        if ($null -ne $archive.GetEntry($embedded)) {
+            throw "APK must not embed ${embedded}: $resolvedApk"
+        }
     }
-    [byte[]]$apkServerProvenanceBytes = Get-ArchiveEntryBytes $archive "assets/csqtt.server-provenance.json"
 } finally {
     $archive.Dispose()
 }
@@ -72,18 +71,6 @@ $sourceHash = Get-Sha256 $sourceBytes
 $apkHash = Get-Sha256 $apkAssetBytes
 if ($sourceHash -ne $apkHash) {
     throw "deploy.sh hash mismatch: source=$sourceHash apk=$apkHash"
-}
-foreach ($serverAssetName in $serverAssetNames) {
-    $sourceServerHash = Get-Sha256 $serverBinaryBytes[$serverAssetName]
-    $apkServerHash = Get-Sha256 $apkServerBinaryBytes[$serverAssetName]
-    if ($sourceServerHash -ne $apkServerHash) {
-        throw "server asset hash mismatch for $serverAssetName`: source=$sourceServerHash apk=$apkServerHash"
-    }
-}
-$sourceServerProvenanceHash = Get-Sha256 $serverProvenanceBytes
-$apkServerProvenanceHash = Get-Sha256 $apkServerProvenanceBytes
-if ($sourceServerProvenanceHash -ne $apkServerProvenanceHash) {
-    throw "server provenance hash mismatch: source=$sourceServerProvenanceHash apk=$apkServerProvenanceHash"
 }
 
 $assetText = [System.Text.Encoding]::UTF8.GetString($apkAssetBytes)
@@ -120,4 +107,4 @@ if (-not $assetText.Contains('docker build --network host') -or
     throw "APK lacks the Docker DNS fallback"
 }
 
-Write-Host "[OK] deploy.sh verified in $(Split-Path -Leaf $resolvedApk): SHA-256 $apkHash"
+Write-Host "[OK] deploy.sh verified in $(Split-Path -Leaf $resolvedApk): SHA-256 $apkHash (no embedded server binaries)"

@@ -140,6 +140,16 @@ android {
         buildConfig = true
     }
 
+    androidResources {
+        // Server binaries stay on disk for local builds and CI provenance,
+        // but deploy now downloads them from GitHub Releases at deploy time,
+        // so they must not bloat the APK. This is the stock AAPT ignore list
+        // plus the three per-architecture server binaries and their provenance.
+        ignoreAssetsPattern =
+            "!.svn:!.git:!.ds_store:!*.scc:.*:<dir>_*:!CVS:!thumbs.db:!picasa.ini:!*~" +
+            ":!csqtt-linux-amd64:!csqtt-linux-arm64:!csqtt-linux-armv7:!csqtt.server-provenance.json"
+    }
+
     lint {
         checkReleaseBuilds = true
         abortOnError = true
