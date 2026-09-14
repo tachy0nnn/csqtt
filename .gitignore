@@ -1,0 +1,12 @@
+# Gradle / Android build outputs
+.gradle/
+build/
+# Rust build outputs
+target/
+# Local IDE state
+.idea/
+# Generated Linux server binaries: produced by rust-server/build_linux.*
+# (or CI) into app assets for provenance checks, but deploy downloads them
+# from GitHub Releases — they must never be committed or embedded blindly.
+app/src/main/assets/csqtt-linux-*
+app/src/main/assets/csqtt.server-provenance.json
