@@ -39,6 +39,7 @@ const RETURN_LATENCY_CAPACITY: usize = 128;
 const RETURN_PRIORITY_CAPACITY: usize = 384;
 const RETURN_BULK_CAPACITY: usize =
     RETURN_CAPACITY - RETURN_LATENCY_CAPACITY - RETURN_PRIORITY_CAPACITY;
+#[cfg(test)]
 pub(crate) const CLIENT_WORKER_PACKET_CHUNK: usize =
     crate::striped_scheduler::BULK_STREAM_STRIPE_PACKET_CHUNK;
 
@@ -129,6 +130,7 @@ impl FastPathScheduler {
         self.begin_for_class(self.worker_count, class)
     }
 
+    #[cfg(test)]
     #[inline(always)]
     fn begin_with_count(&mut self, worker_count: usize, packet: &[u8]) -> Option<DispatchTicket> {
         self.begin_for_class(worker_count, packet_class(packet))
@@ -302,6 +304,7 @@ impl PacketReceiver {
         self.shared.notify.notify_waiters();
     }
 
+    #[cfg(test)]
     fn suspend(&self) {
         let state = self.shared.state.load(Ordering::Acquire);
         self.shared
@@ -614,6 +617,9 @@ impl Dispatcher {
     }
 
     #[cfg(unix)]
+    // Task root wiring: TUN file, three return channels, pool, stats and FD
+    // replacements are all load-bearing, so the arity stays above the lint.
+    #[allow(clippy::too_many_arguments)]
     async fn run_tun(
         self: &Arc<Self>,
         initial_file: File,
@@ -657,6 +663,7 @@ impl Dispatcher {
     }
 
     #[cfg(not(unix))]
+    #[allow(clippy::too_many_arguments)]
     async fn run_tun(
         self: &Arc<Self>,
         _file: File,
@@ -885,10 +892,10 @@ impl Dispatcher {
             };
             let mut burst = 0usize;
             let state = loop {
-                let state = {
-                    let (packet, written) = pending.as_mut().expect("TUN packet is pending");
-                    self.try_write_tun_packet(&mut guard, &stats, packet, written)
+                let Some((packet, written)) = pending.as_mut() else {
+                    break TunWriteState::Complete;
                 };
+                let state = self.try_write_tun_packet(&mut guard, &stats, packet, written);
                 match state {
                     TunWriteState::Complete => {
                         burst += 1;
@@ -922,7 +929,7 @@ impl Dispatcher {
                 }
                 TunWriteState::Yield => tokio::task::yield_now().await,
                 TunWriteState::Closed | TunWriteState::Failed => return,
-                TunWriteState::Continue => unreachable!(),
+                TunWriteState::Continue => continue,
             }
         }
     }
