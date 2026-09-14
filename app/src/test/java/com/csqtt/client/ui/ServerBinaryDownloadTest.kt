@@ -29,13 +29,24 @@ private fun testFetch(
     checksums: String = testChecksums(),
     provenance: String = testProvenance(),
     binary: ByteArray = TEST_BYTES,
+    chunkedBinary: Boolean = false,
     requested: MutableList<String> = mutableListOf(),
-): (String) -> ByteArray = { url ->
+): (String, (Long, Long?) -> Unit) -> ByteArray = { url, onChunk ->
     requested.add(url)
     when {
         url.endsWith("/SHA256SUMS") -> checksums.toByteArray()
         url.endsWith("/csqtt.server-provenance.json") -> provenance.toByteArray()
-        url.endsWith("/csqtt-linux-amd64") -> binary
+        url.endsWith("/csqtt-linux-amd64") -> {
+            if (chunkedBinary) {
+                var sent = 0L
+                val step = (binary.size / 4).coerceAtLeast(1)
+                while (sent < binary.size) {
+                    sent = minOf(sent + step, binary.size.toLong())
+                    onChunk(sent, binary.size.toLong())
+                }
+            }
+            binary
+        }
         else -> throw IOException("HTTP 404 for $url")
     }
 }
@@ -160,9 +171,9 @@ class ServerBinaryDownloadTest {
     fun provenanceFailureStopsBeforeBinaryFetch() {
         val requested = mutableListOf<String>()
         val fetch = testFetch(requested = requested)
-        val failing: (String) -> ByteArray = { url ->
+        val failing: (String, (Long, Long?) -> Unit) -> ByteArray = { url, _ ->
             if (url.endsWith("/csqtt.server-provenance.json")) throw IOException("network down")
-            fetch(url)
+            fetch(url) { _, _ -> }
         }
         try {
             downloadServerBinary("2.1.9", ServerArchitecture.AMD64, failing)
@@ -184,6 +195,84 @@ class ServerBinaryDownloadTest {
             assertTrue(message.contains("aarch64"))
         }
     }
+
+    @Test
+    fun chunkedDownloadReportsMonotonicProgressEndingAtFull() {
+        val fractions = mutableListOf<Float?>()
+        val dir = tempFolder.newFolder("deploy-progress")
+        resolveServerBinary(
+            dir, ServerArchitecture.AMD64, "2.1.9",
+            testFetch(chunkedBinary = true),
+            onDownloadProgress = { fractions.add(it) }
+        )
+        assertTrue(fractions.isNotEmpty())
+        assertTrue(fractions.last() == 1.0f)
+        val known = fractions.filterNotNull()
+        assertTrue(known.isNotEmpty())
+        assertTrue(known.zipWithNext().all { (a, b) -> b >= a })
+    }
+
+    @Test
+    fun unchunkedDownloadStillCompletesProgress() {
+        val fractions = mutableListOf<Float?>()
+        val dir = tempFolder.newFolder("deploy-progress-plain")
+        resolveServerBinary(
+            dir, ServerArchitecture.AMD64, "2.1.9",
+            testFetch(),
+            onDownloadProgress = { fractions.add(it) }
+        )
+        assertEquals(listOf(1.0f), fractions)
+    }
+
+    @Test
+    fun integrityFailureMapsToFriendlyError() {
+        assertEquals(
+            "Сервер не прошёл проверку целостности и не был установлен — повторите установку",
+            friendlyDeployError("Сервер amd64 (v2.1.9) не прошёл проверку целостности (SHA-256); установка остановлена")
+        )
+    }
+
+    @Test
+    fun downloadFailuresMapToFriendlyError() {
+        val expected = "Не удалось скачать сервер с GitHub Releases — проверьте интернет и повторите установку"
+        assertEquals(
+            expected,
+            friendlyDeployError("Не удалось скачать сервер amd64 (v2.1.9): проверьте соединение и повторите")
+        )
+        assertEquals(
+            expected,
+            friendlyDeployError("Не удалось получить контрольные суммы сервера amd64 (v2.1.9): проверьте соединение и повторите")
+        )
+        assertEquals(
+            expected,
+            friendlyDeployError("Не удалось получить описание релиза v2.1.9: проверьте соединение и повторите")
+        )
+        assertEquals(
+            expected,
+            friendlyDeployError("Описание релиза v2.1.9 повреждено")
+        )
+        assertEquals(
+            expected,
+            friendlyDeployError("Описание релиза v2.1.9 не содержит csqtt-linux-amd64")
+        )
+        assertEquals(
+            expected,
+            friendlyDeployError("Контрольные суммы релиза v2.1.9 не содержат csqtt-linux-amd64")
+        )
+    }
+
+    @Test
+    fun sizeAndEmptyFailuresMapToIntegrityError() {
+        val expected = "Сервер не прошёл проверку целостности и не был установлен — повторите установку"
+        assertEquals(
+            expected,
+            friendlyDeployError("Размер сервера amd64 (v2.1.9) не совпадает с описанием релиза; установка остановлена")
+        )
+        assertEquals(
+            expected,
+            friendlyDeployError("Скачанный сервер amd64 (v2.1.9) пуст; повторите установку")
+        )
+    }
     @Test
     fun provenanceVersionMismatchIsRejected() {
         try {
@@ -198,9 +287,9 @@ class ServerBinaryDownloadTest {
     fun checksumsFailureStopsBeforeBinaryFetch() {
         val requested = mutableListOf<String>()
         val fetch = testFetch(requested = requested)
-        val failing: (String) -> ByteArray = { url ->
+        val failing: (String, (Long, Long?) -> Unit) -> ByteArray = { url, _ ->
             if (url.endsWith("/SHA256SUMS")) throw IOException("network down")
-            fetch(url)
+            fetch(url) { received, total -> }
         }
         try {
             downloadServerBinary("2.1.9", ServerArchitecture.AMD64, failing)
@@ -235,7 +324,7 @@ class ServerBinaryDownloadTest {
     @Test
     fun resolveFailureMapsToActionableMessage() {
         val dir = tempFolder.newFolder("deploy-offline")
-        val failing: (String) -> ByteArray = { throw IOException("HTTP 404 for $it") }
+        val failing: (String, (Long, Long?) -> Unit) -> ByteArray = { _, _ -> throw IOException("HTTP 404") }
         try {
             resolveServerBinary(dir, ServerArchitecture.ARM64, "2.1.9", failing)
             fail("failed download must abort resolution")

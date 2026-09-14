@@ -89,6 +89,16 @@ internal fun friendlyDeployError(message: String?): String {
             "SSH-аутентификация отклонена: проверьте логин, пароль и разрешение PasswordAuthentication на VPS"
         text.contains("SFTP/SCP upload failed", ignoreCase = true) ->
             "Загрузка на VPS оборвалась даже после автоматического переподключения SSH; проверьте стабильность Wi-Fi и подробную причину в errors.log"
+        text.contains("проверку целостности", ignoreCase = true) ||
+            text.contains("не совпадает с описанием релиза", ignoreCase = true) ||
+            text.contains("пуст; повторите установку", ignoreCase = true) ->
+            "Сервер не прошёл проверку целостности и не был установлен — повторите установку"
+        text.contains("Не удалось скачать сервер", ignoreCase = true) ||
+            text.contains("Не удалось получить контрольные суммы", ignoreCase = true) ||
+            text.contains("Не удалось получить описание релиза", ignoreCase = true) ||
+            text.contains("Описание релиза", ignoreCase = true) ||
+            text.contains("Контрольные суммы релиза", ignoreCase = true) ->
+            "Не удалось скачать сервер с GitHub Releases — проверьте интернет и повторите установку"
         text.contains("reject HostKey", ignoreCase = true) ||
             text.contains("HostKey", ignoreCase = true) ||
             text.contains("host key", ignoreCase = true) ->
@@ -197,9 +207,13 @@ internal fun resolveServerBinary(
     workingDir: File,
     architecture: ServerArchitecture,
     versionTag: String = BuildConfig.VERSION_NAME,
-    fetchBytes: (String) -> ByteArray = ::fetchReleaseBytes,
+    fetchBytes: (String, (Long, Long?) -> Unit) -> ByteArray = { url, onChunk -> fetchReleaseBytes(url, onChunk) },
+    onDownloadProgress: (Float?) -> Unit = {},
 ): File {
-    val binary = downloadServerBinary(versionTag, architecture, fetchBytes)
+    val binary = downloadServerBinary(versionTag, architecture, fetchBytes) { received, total ->
+        onDownloadProgress(if (total != null && total > 0) received.toFloat() / total else null)
+    }
+    onDownloadProgress(1.0f)
     return writeWorkingDirFile(workingDir, architecture.assetName, binary)
 }
 
@@ -228,7 +242,7 @@ internal fun serverBinaryDownloadUrl(versionTag: String, architecture: ServerArc
 private const val SERVER_BINARY_CONNECT_TIMEOUT_MS = 15_000
 private const val SERVER_BINARY_READ_TIMEOUT_MS = 60_000
 
-internal fun fetchReleaseBytes(url: String): ByteArray {
+internal fun fetchReleaseBytes(url: String, onChunk: (Long, Long?) -> Unit = { _, _ -> }): ByteArray {
     var conn: HttpURLConnection? = null
     try {
         conn = URL(url).openConnection() as HttpURLConnection
@@ -241,7 +255,22 @@ internal fun fetchReleaseBytes(url: String): ByteArray {
         conn.readTimeout = SERVER_BINARY_READ_TIMEOUT_MS
         val code = conn.responseCode
         if (code !in 200..299) throw IOException("HTTP $code for $url")
-        return (conn.inputStream ?: throw IOException("Empty response for $url")).use { it.readBytes() }
+        val input = conn.inputStream ?: throw IOException("Empty response for $url")
+        val total = conn.contentLengthLong.takeIf { it > 0 }
+        val output = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(32 * 1024)
+        var received = 0L
+        input.use { stream ->
+            while (true) {
+                val read = stream.read(buffer)
+                if (read < 0) break
+                output.write(buffer, 0, read)
+                received += read
+                onChunk(received, total)
+            }
+        }
+        onChunk(received, total ?: received)
+        return output.toByteArray()
     } finally {
         conn?.disconnect()
     }
@@ -293,11 +322,14 @@ internal fun checkServerProvenance(text: String, versionTag: String, architectur
 internal fun downloadServerBinary(
     versionTag: String,
     architecture: ServerArchitecture,
-    fetchBytes: (String) -> ByteArray = ::fetchReleaseBytes,
+    fetchBytes: (String, (Long, Long?) -> Unit) -> ByteArray =
+        { url, onChunk -> fetchReleaseBytes(url, onChunk) },
+    onBinaryProgress: (Long, Long?) -> Unit = { _, _ -> },
 ): ByteArray {
     val tag = normalizeVersionTag(versionTag)
+    val fetchText = { url: String -> fetchBytes(url) { _, _ -> } }
     val checksums = fetchReleaseText(
-        fetchBytes,
+        fetchText,
         serverReleaseAssetUrl(tag, CsqttConstants.Update.SERVER_CHECKSUMS_ASSET),
         "Не удалось получить контрольные суммы сервера ${architecture.displayName} ($tag): " +
             "проверьте соединение и повторите"
@@ -305,13 +337,13 @@ internal fun downloadServerBinary(
     val expected = parseServerChecksums(checksums, architecture.assetName)
         ?: throw IOException("Контрольные суммы релиза $tag не содержат ${architecture.assetName}")
     val provenance = fetchReleaseText(
-        fetchBytes,
+        fetchText,
         serverReleaseAssetUrl(tag, CsqttConstants.Update.SERVER_PROVENANCE_ASSET),
         "Не удалось получить описание релиза $tag: проверьте соединение и повторите"
     )
     val expectedSize = checkServerProvenance(provenance, tag, architecture)
     val binary = try {
-        fetchBytes(serverBinaryDownloadUrl(tag, architecture))
+        fetchBytes(serverBinaryDownloadUrl(tag, architecture), onBinaryProgress)
     } catch (e: IOException) {
         throw IOException(
             "Не удалось скачать сервер ${architecture.displayName} ($tag): " +
@@ -756,7 +788,13 @@ internal suspend fun performDeploy(
         }
 
         val scriptFile = extractAsset("deploy.sh")
-        val serverFile = resolveServerBinary(workingDir, serverArchitecture)
+        val serverFile = resolveServerBinary(workingDir, serverArchitecture) { fraction ->
+            if (fraction != null) {
+                onProgress(0.05f + 0.04f * fraction, "Загрузка сервера... ${(fraction * 100).toInt()}%")
+            } else {
+                onProgress(0.05f, "Загрузка сервера...")
+            }
+        }
         val environmentFile = File(workingDir, "csqtt.env").apply {
             writeText(
                 buildString {
