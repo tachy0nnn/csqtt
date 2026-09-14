@@ -74,8 +74,11 @@ jobs:
         shell: bash
         working-directory: rust-server
     steps:
+      # Runs before checkout, so it must NOT inherit the job-level
+      # rust-server working directory (it does not exist yet).
       - name: Resolve release tag
         id: release-tag
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
           if [[ "${{ github.ref_type }}" == "tag" ]]; then
