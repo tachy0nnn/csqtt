@@ -92,6 +92,10 @@ object CsqttConstants {
             "https://api.github.com/repos/amurcanov/csqtt/tags?per_page=100"
         const val GITHUB_TAG_TREE_URL_PREFIX =
             "https://github.com/amurcanov/csqtt/tree/"
+        const val GITHUB_RELEASE_DOWNLOAD_URL_PREFIX =
+            "https://github.com/amurcanov/csqtt/releases/download/"
+        const val SERVER_PROVENANCE_ASSET = "csqtt.server-provenance.json"
+        const val SERVER_CHECKSUMS_ASSET = "SHA256SUMS"
     }
 
     object Notifications {

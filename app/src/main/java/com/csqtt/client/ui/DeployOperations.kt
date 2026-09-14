@@ -4,9 +4,11 @@
 package com.csqtt.client.ui
 
 import android.content.Context
+import com.csqtt.client.BuildConfig
 import com.csqtt.client.CsqttConstants
 import com.csqtt.client.DeployManager
 import com.csqtt.client.TunnelManager
+import com.csqtt.client.normalizeVersionTag
 import net.schmizz.sshj.SSHClient as SshjClient
 import net.schmizz.sshj.xfer.FileSystemFile
 import net.schmizz.sshj.transport.verification.PromiscuousVerifier
@@ -18,6 +20,9 @@ import org.bouncycastle.jce.provider.BouncyCastleProvider
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
+import java.security.MessageDigest
 import java.security.Security
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
@@ -189,18 +194,146 @@ internal fun serverArchitectureForMachine(output: String): ServerArchitecture {
 }
 
 internal fun resolveServerBinary(
-    context: Context,
     workingDir: File,
     architecture: ServerArchitecture,
+    versionTag: String = BuildConfig.VERSION_NAME,
+    fetchBytes: (String) -> ByteArray = ::fetchReleaseBytes,
 ): File {
-    val target = File(workingDir, architecture.assetName)
-    context.assets.open(architecture.assetName).use { input ->
-        FileOutputStream(target).use { output -> input.copyTo(output) }
-    }
-    if (!target.isFile || target.length() == 0L) {
-        throw IOException("Файл ${architecture.assetName} отсутствует или пуст в assets")
+    val binary = downloadServerBinary(versionTag, architecture, fetchBytes)
+    return writeWorkingDirFile(workingDir, architecture.assetName, binary)
+}
+
+private fun writeWorkingDirFile(workingDir: File, name: String, bytes: ByteArray): File {
+    val target = File(workingDir, name)
+    try {
+        FileOutputStream(target).use { it.write(bytes) }
+    } catch (e: IOException) {
+        runCatching { target.delete() }
+        throw e
     }
     return target
+}
+
+private const val SERVER_BINARY_DOWNLOAD_URL_PREFIX =
+    CsqttConstants.Update.GITHUB_RELEASE_DOWNLOAD_URL_PREFIX
+
+internal fun serverReleaseAssetUrl(versionTag: String, assetName: String): String {
+    val tag = normalizeVersionTag(versionTag)
+    return "$SERVER_BINARY_DOWNLOAD_URL_PREFIX$tag/$assetName"
+}
+
+internal fun serverBinaryDownloadUrl(versionTag: String, architecture: ServerArchitecture): String =
+    serverReleaseAssetUrl(versionTag, architecture.assetName)
+
+private const val SERVER_BINARY_CONNECT_TIMEOUT_MS = 15_000
+private const val SERVER_BINARY_READ_TIMEOUT_MS = 60_000
+
+internal fun fetchReleaseBytes(url: String): ByteArray {
+    var conn: HttpURLConnection? = null
+    try {
+        conn = URL(url).openConnection() as HttpURLConnection
+        conn.useCaches = false
+        conn.instanceFollowRedirects = true
+        conn.requestMethod = "GET"
+        conn.setRequestProperty("Cache-Control", "no-cache")
+        conn.setRequestProperty("User-Agent", "CSQTTAndroid/${BuildConfig.VERSION_NAME}")
+        conn.connectTimeout = SERVER_BINARY_CONNECT_TIMEOUT_MS
+        conn.readTimeout = SERVER_BINARY_READ_TIMEOUT_MS
+        val code = conn.responseCode
+        if (code !in 200..299) throw IOException("HTTP $code for $url")
+        return (conn.inputStream ?: throw IOException("Empty response for $url")).use { it.readBytes() }
+    } finally {
+        conn?.disconnect()
+    }
+}
+
+private fun fetchReleaseText(fetchBytes: (String) -> ByteArray, url: String, failureMessage: String): String =
+    try {
+        fetchBytes(url).toString(Charsets.UTF_8)
+    } catch (e: IOException) {
+        throw IOException(failureMessage)
+    }
+
+internal fun parseServerChecksums(text: String, assetName: String): String? {    for (rawLine in text.lineSequence()) {
+        val parts = rawLine.trim().split(Regex("\\s+"))
+        if (parts.size < 2) continue
+        val hash = parts[0].lowercase(Locale.ROOT)
+        if (hash.length != 64 || !hash.all { it in '0'..'9' || it in 'a'..'f' }) continue
+        if (parts.last().trimStart('*') == assetName) return hash
+    }
+    return null
+}
+
+private fun sha256Hex(bytes: ByteArray): String {
+    val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
+    return buildString(digest.size * 2) { for (b in digest) append("%02x".format(b)) }
+}
+
+internal fun checkServerProvenance(text: String, versionTag: String, architecture: ServerArchitecture): Long {
+    val manifest = try {
+        JSONObject(text)
+    } catch (e: Exception) {
+        throw IOException("Описание релиза $versionTag повреждено")
+    }
+    if (normalizeVersionTag(manifest.optString("version")) != versionTag) {
+        throw IOException("Описание релиза не соответствует версии $versionTag")
+    }
+    val artifacts = manifest.optJSONArray("artifacts")
+    if (artifacts != null) {
+        for (i in 0 until artifacts.length()) {
+            val artifact = artifacts.optJSONObject(i)
+            if (artifact?.optString("assetName") == architecture.assetName) {
+                return artifact.optLong("binarySize", -1L)
+            }
+        }
+    }
+    throw IOException("Описание релиза $versionTag не содержит ${architecture.assetName}")
+}
+
+internal fun downloadServerBinary(
+    versionTag: String,
+    architecture: ServerArchitecture,
+    fetchBytes: (String) -> ByteArray = ::fetchReleaseBytes,
+): ByteArray {
+    val tag = normalizeVersionTag(versionTag)
+    val checksums = fetchReleaseText(
+        fetchBytes,
+        serverReleaseAssetUrl(tag, CsqttConstants.Update.SERVER_CHECKSUMS_ASSET),
+        "Не удалось получить контрольные суммы сервера ${architecture.displayName} ($tag): " +
+            "проверьте соединение и повторите"
+    )
+    val expected = parseServerChecksums(checksums, architecture.assetName)
+        ?: throw IOException("Контрольные суммы релиза $tag не содержат ${architecture.assetName}")
+    val provenance = fetchReleaseText(
+        fetchBytes,
+        serverReleaseAssetUrl(tag, CsqttConstants.Update.SERVER_PROVENANCE_ASSET),
+        "Не удалось получить описание релиза $tag: проверьте соединение и повторите"
+    )
+    val expectedSize = checkServerProvenance(provenance, tag, architecture)
+    val binary = try {
+        fetchBytes(serverBinaryDownloadUrl(tag, architecture))
+    } catch (e: IOException) {
+        throw IOException(
+            "Не удалось скачать сервер ${architecture.displayName} ($tag): " +
+                "проверьте соединение и повторите"
+        )
+    }
+    if (binary.isEmpty()) {
+        throw IOException("Скачанный сервер ${architecture.displayName} ($tag) пуст; повторите установку")
+    }
+    if (expectedSize >= 0 && binary.size.toLong() != expectedSize) {
+        throw IOException(
+            "Размер сервера ${architecture.displayName} ($tag) не совпадает с описанием релиза; " +
+                "установка остановлена"
+        )
+    }
+    if (sha256Hex(binary) != expected) {
+        throw IOException(
+            "Сервер ${architecture.displayName} ($tag) не прошёл проверку целостности " +
+                "(SHA-256); установка остановлена"
+        )
+    }
+    return binary
 }
 
 private fun deployAssetLabel(fileName: String): String = when (fileName) {
@@ -615,18 +748,15 @@ internal suspend fun performDeploy(
             throw IOException("Не удалось создать временный каталог установки")
         }
         fun extractAsset(assetName: String): File {
-            val target = File(workingDir, assetName)
-            context.assets.open(assetName).use { input ->
-                FileOutputStream(target).use { output -> input.copyTo(output) }
-            }
-            if (!target.isFile || target.length() == 0L) {
+            val bytes = context.assets.open(assetName).use { it.readBytes() }
+            if (bytes.isEmpty()) {
                 throw IOException("Файл $assetName отсутствует или пуст в assets")
             }
-            return target
+            return writeWorkingDirFile(workingDir, assetName, bytes)
         }
 
         val scriptFile = extractAsset("deploy.sh")
-        val serverFile = resolveServerBinary(context, workingDir, serverArchitecture)
+        val serverFile = resolveServerBinary(workingDir, serverArchitecture)
         val environmentFile = File(workingDir, "csqtt.env").apply {
             writeText(
                 buildString {
